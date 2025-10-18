@@ -42,8 +42,10 @@ async function cleanupSession() {
   console.log("Limpiando sesión anterior...");
   if (sock) {
     try {
+      // Correcto: La función es sock.ev.removeAllListeners() o simplemente dejar que se desconecte.
+      // El error 'sock.removeAllListeners is not a function' indica que no está en el objeto principal.
+      // sock.end() es suficiente para la mayoría de los casos.
       sock.end();
-      sock.removeAllListeners();
     } catch (error) {
       console.warn("Error al cerrar socket:", error.message);
     }
@@ -101,8 +103,7 @@ async function connectToWhatsApp() {
 
       connectionStatus = "desconectado";
       console.error(
-        `Conexión cerrada. Razón: ${DisconnectReason[statusCode] || "Desconocida"
-        }`
+        `Conexión cerrada. Razón: ${DisconnectReason[statusCode] || "Desconocida"}`
       );
 
       if (shouldReconnect) {
@@ -135,6 +136,10 @@ const formatJid = (number) => {
 // --- Configuración del Servidor (Express) ---
 
 const app = express();
+
+// CORRECCIÓN CRÍTICA PARA RAILWAY Y SIMILARES
+// Esta línea le dice a Express que confíe en la información del proxy.
+app.set('trust proxy', 1);
 
 // Middlewares de Seguridad
 app.use(helmet());
