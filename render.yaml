@@ -1,0 +1,14 @@
+# render.yaml (Versión final recomendada)
+
+services:
+  - type: web
+    name: whatsapp-api
+    runtime: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "node index.js"
+
+    # Solo necesitas la API_KEY para proteger tus endpoints.
+    envVars:
+      - key: API_KEY
+        sync: false
