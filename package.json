@@ -1,21 +1,22 @@
 {
   "name": "whatsapp-api-lovable-pro",
-  "version": "2.0.0",
-  "description": "API conectar con WhatsApp usando Baileys v7+",
+  "version": "2.1.0",
+  "description": "API robusta y actualizada para conectar con WhatsApp usando Baileys",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "author": "Cristhian Zavala",
+  "author": "Cristhian",
   "license": "ISC",
   "dependencies": {
     "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "^6.7.5",
+    "@whiskeysockets/baileys": "latest",
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "express-rate-limit": "^7.3.1",
     "helmet": "^7.1.0",
-    "pino": "^9.2.0"
+    "pino": "^9.2.0",
+    "pino-pretty": "^11.2.1"
   }
 }
