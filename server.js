@@ -87,16 +87,29 @@ async function initializeWhatsApp() {
         '--disable-software-rasterizer',
         '--disable-web-security',
         '--no-first-run',
-        '--no-default-browser-check'
+        '--no-default-browser-check',
+        '--single-process',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding'
       ],
+      timeout: 60000, // Aumentar timeout para Railway
     },
     webVersionCache: {
       type: 'remote',
       remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
     },
+    qrMaxRetries: 3, // Limitar intentos de QR
   });
 
-  // Evento: Generación de QR
+  // Evento: Autenticación (cuando existe sesión guardada)
+  client.on('authenticated', () => {
+    logger.info('Client authenticated with saved session!');
+    SESSION_STATE.status = 'connecting';
+    SESSION_STATE.qr = null; // No necesita QR si hay sesión
+  });
+
+  // Evento: Generación de QR (solo si no hay sesión guardada)
   client.on('qr', async (qrString) => {
     try {
       const base64Qr = await qrcode.toDataURL(qrString);
@@ -235,24 +248,47 @@ app.get('/api/status', (req, res) => {
   });
 });
 
+app.post('/api/init', async (req, res, next) => {
+  try {
+    if (SESSION_STATE.status === 'connected') {
+      return res.status(200).json({ message: 'Client is already connected', status: 'connected' });
+    }
+
+    if (SESSION_STATE.status === 'connecting' || SESSION_STATE.status === 'qr') {
+      return res.status(200).json({ message: 'Client is already initializing', status: SESSION_STATE.status });
+    }
+
+    // Iniciar el cliente
+    initializeWhatsApp();
+
+    return res.status(202).json({ message: 'WhatsApp client initialization started', status: 'connecting' });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/qr', async (req, res, next) => {
   try {
     if (SESSION_STATE.status === 'connected') {
       return res.status(200).json({ message: 'Client is already connected' });
     }
-    
+
     if (SESSION_STATE.status === 'qr' && SESSION_STATE.qr) {
       // El QR ya existe, enviarlo
       return res.status(200).json({ qr: SESSION_STATE.qr });
     }
 
-    // Si está desconectado o en error, intentar (re)iniciar
-    if (SESSION_STATE.status === 'disconnected' || SESSION_STATE.status === 'error') {
-       initializeWhatsApp(); // Inicia en segundo plano, NO se espera (await)
+    if (SESSION_STATE.status === 'connecting') {
+      return res.status(202).json({ message: 'Client is connecting, QR will be available soon...' });
     }
 
-    // Informar al frontend que debe esperar y sondear
-    return res.status(202).json({ message: 'Initializing session, please check status again...' });
+    // Si está desconectado o en error, sugerir usar /api/init
+    if (SESSION_STATE.status === 'disconnected' || SESSION_STATE.status === 'error') {
+      return res.status(400).json({ message: 'Client not initialized. Use POST /api/init first', status: SESSION_STATE.status });
+    }
+
+    // Estado inesperado
+    return res.status(500).json({ message: 'Unexpected state', status: SESSION_STATE.status });
   } catch (error) {
     next(error);
   }
@@ -321,11 +357,10 @@ const startServer = () => {
   server.listen(PORT, () => {
     logger.info(`Server running on port ${PORT} in ${NODE_ENV} mode`);
     logger.info(`Session Path: ${SESSION_PATH}`);
-    
-    // Iniciar la conexión de WhatsApp al arrancar el servidor
-    initializeWhatsApp().catch(err => {
-      logger.error("Failed to initialize whatsapp-web.js on startup:", err.message);
-    });
+    logger.info('WhatsApp client will initialize on first /api/qr or /api/reconnect request');
+
+    // NO iniciar automáticamente para evitar QRs innecesarios en Railway
+    // El cliente se iniciará cuando el usuario lo solicite mediante /api/qr
   });
 };
 
