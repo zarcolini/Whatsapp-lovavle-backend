@@ -77,7 +77,22 @@ async function initializeWhatsApp() {
     authStrategy: new LocalAuth({ dataPath: SESSION_PATH, clientId: SESSION_NAME }),
     puppeteer: {
       headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--no-zygote'],
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--no-zygote',
+        '--disable-extensions',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--disable-web-security',
+        '--no-first-run',
+        '--no-default-browser-check'
+      ],
+    },
+    webVersionCache: {
+      type: 'remote',
+      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
     },
   });
 
@@ -114,6 +129,21 @@ async function initializeWhatsApp() {
   client.on('auth_failure', (msg) => {
     logger.error({ msg }, 'AUTHENTICATION FAILURE. Closing session.');
     closeSession(); // Forzar cierre y limpieza
+  });
+
+  // Evento: Error remoto (errores de navegación de Puppeteer)
+  client.on('remote_session_saved', () => {
+    logger.info('Remote session saved successfully');
+  });
+
+  // Manejo de errores del cliente
+  client.on('change_state', (state) => {
+    logger.info(`Client state changed to: ${state}`);
+  });
+
+  // Manejo de errores de loading screen
+  client.on('loading_screen', (percent, message) => {
+    logger.info(`Loading screen: ${percent}% - ${message}`);
   });
 
   SESSION_STATE.client = client;
@@ -311,12 +341,34 @@ const gracefulShutdown = async (signal) => {
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
-process.on('unhandledRejection', (reason) => {
+process.on('unhandledRejection', (reason, promise) => {
+  // Si el error es de contexto de ejecución destruido, solo loguear sin cerrar
+  if (reason && reason.message && reason.message.includes('Execution context was destroyed')) {
+    logger.warn(reason, 'Puppeteer navigation error detected, attempting to recover...');
+    // Intentar reconectar automáticamente
+    if (SESSION_STATE.status === 'connected' || SESSION_STATE.status === 'connecting') {
+      logger.info('Attempting automatic reconnection...');
+      closeSession().then(() => {
+        setTimeout(() => {
+          initializeWhatsApp().catch(err => logger.error(err, 'Failed to auto-reconnect'));
+        }, 5000);
+      });
+    }
+    return;
+  }
+
+  // Para otros errores no manejados, cerrar el proceso
   logger.fatal(reason, 'UNHANDLED REJECTION! Shutting down...');
   process.exit(1);
 });
 
 process.on('uncaughtException', (err) => {
+  // Si el error es de contexto de ejecución destruido, solo loguear sin cerrar
+  if (err.message && err.message.includes('Execution context was destroyed')) {
+    logger.warn(err, 'Puppeteer navigation error detected (uncaught exception)');
+    return;
+  }
+
   logger.fatal(err, 'UNCAUGHT EXCEPTION! Shutting down...');
   process.exit(1);
 });
