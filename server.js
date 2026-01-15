@@ -5,13 +5,13 @@ import helmet from 'helmet';
 import { body, validationResult } from 'express-validator';
 import pino from 'pino';
 import http from 'http';
-// --- INICIO DE LA CORRECCIÓN ---
-// Esta es la forma de importar un módulo CommonJS (como whatsapp-web.js)
-// dentro de un módulo ES (tu server.js)
-import pkg from 'whatsapp-web.js';
-const { Client, LocalAuth } = pkg;
-// --- FIN DE LA CORRECCIÓN ---
 import qrcode from 'qrcode';
+import makeWASocket, {
+  DisconnectReason,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore
+} from '@whiskeysockets/baileys';
 
 // ============================================================
 // 1. CONFIGURACIÓN Y VARIABLES DE ENTORNO
@@ -21,8 +21,7 @@ dotenv.config();
 const PORT = process.env.PORT || 3000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const AUTH_TOKEN = process.env.AUTH_TOKEN;
-const SESSION_NAME = process.env.WPP_SESSION_NAME || 'default-session';
-const SESSION_PATH = process.env.WPP_SESSION_PATH || './wpp_session_data';
+const SESSION_PATH = process.env.WPP_SESSION_PATH || './baileys_auth_info';
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 
 if (!AUTH_TOKEN) {
@@ -34,11 +33,11 @@ if (!AUTH_TOKEN) {
 // 2. LOGGER (PINO)
 // ============================================================
 const transport = NODE_ENV === 'development'
-? {
-    target: 'pino-pretty',
-    options: { colorize: true, translateTime: 'SYS:yyyy-mm-dd HH:MM:ss', ignore: 'pid,hostname' },
-  }
-: undefined;
+  ? {
+      target: 'pino-pretty',
+      options: { colorize: true, translateTime: 'SYS:yyyy-mm-dd HH:MM:ss', ignore: 'pid,hostname' },
+    }
+  : undefined;
 
 const logger = pino({ level: LOG_LEVEL, transport });
 
@@ -49,157 +48,141 @@ class AppError extends Error {
   constructor(message, statusCode) {
     super(message);
     this.statusCode = statusCode;
-    this.status = `${statusCode}`.startsWith('4')? 'fail' : 'error';
+    this.status = `${statusCode}`.startsWith('4') ? 'fail' : 'error';
     this.isOperational = true;
     Error.captureStackTrace(this, this.constructor);
   }
 }
 
 // ============================================================
-// 4. GESTIÓN DE ESTADO Y SERVICIO DE WHATSAPP (whatsapp-web.js)
+// 4. GESTIÓN DE ESTADO Y SERVICIO DE WHATSAPP (Baileys)
 // ============================================================
 const SESSION_STATE = {
-  client: null,
+  socket: null,
   status: 'disconnected', // 'disconnected', 'qr', 'connecting', 'connected', 'error'
   qr: null, // Almacenará el QR en formato base64 Data URL
+  retryCount: 0,
+  maxRetries: 3,
 };
 
 async function initializeWhatsApp() {
-  if (SESSION_STATE.client) {
-    logger.info('WhatsApp client already exists.');
+  if (SESSION_STATE.socket) {
+    logger.info('WhatsApp socket already exists.');
     return;
   }
 
-  logger.info('Creating new whatsapp-web.js client...');
+  logger.info('Creating new Baileys WhatsApp socket...');
   SESSION_STATE.status = 'connecting';
 
-  const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: SESSION_PATH, clientId: SESSION_NAME }),
-    puppeteer: {
-      headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--no-zygote',
-        '--disable-extensions',
-        '--disable-gpu',
-        '--disable-software-rasterizer',
-        '--disable-web-security',
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--single-process',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-renderer-backgrounding'
-      ],
-      timeout: 60000, // Aumentar timeout para Railway
-    },
-    webVersionCache: {
-      type: 'remote',
-      remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-    },
-    qrMaxRetries: 3, // Limitar intentos de QR
-  });
-
-  // Evento: Autenticación (cuando existe sesión guardada)
-  client.on('authenticated', () => {
-    logger.info('Client authenticated with saved session!');
-    SESSION_STATE.status = 'connecting';
-    SESSION_STATE.qr = null; // No necesita QR si hay sesión
-  });
-
-  // Evento: Generación de QR (solo si no hay sesión guardada)
-  client.on('qr', async (qrString) => {
-    try {
-      const base64Qr = await qrcode.toDataURL(qrString);
-      SESSION_STATE.qr = base64Qr;
-      SESSION_STATE.status = 'qr';
-      logger.info('New QR code available. Scan to connect.');
-    } catch (err) {
-      logger.error(err, 'Error generating QR code data URL');
-    }
-  });
-
-  // Evento: Cliente listo y conectado
-  client.on('ready', () => {
-    logger.info('Client is ready and connected!');
-    SESSION_STATE.status = 'connected';
-    SESSION_STATE.qr = null;
-  });
-
-  // Evento: Cliente desconectado
-  client.on('disconnected', (reason) => {
-    logger.warn({ reason }, 'Client was disconnected');
-
-    // Si se alcanzó el máximo de reintentos de QR, no intentar reconectar automáticamente
-    if (reason === 'Max qrcode retries reached') {
-      logger.warn('Max QR retries reached. Client will not auto-reconnect. Use /api/init to restart.');
-      // Limpiar el cliente para evitar fugas de memoria
-      const clientToDestroy = SESSION_STATE.client;
-      SESSION_STATE.client = null;
-      SESSION_STATE.status = 'error';
-      SESSION_STATE.qr = null;
-
-      if (clientToDestroy) {
-        clientToDestroy.destroy().catch(err => logger.error(err, 'Error destroying client'));
-      }
-      return;
-    }
-
-    // Para otras razones de desconexión, resetear el estado normalmente
-    SESSION_STATE.client = null;
-    SESSION_STATE.status = 'disconnected';
-    SESSION_STATE.qr = null;
-  });
-
-  // Evento: Falla de autenticación (ej. sesión eliminada en el teléfono)
-  client.on('auth_failure', (msg) => {
-    logger.error({ msg }, 'AUTHENTICATION FAILURE. Closing session.');
-    closeSession(); // Forzar cierre y limpieza
-  });
-
-  // Evento: Error remoto (errores de navegación de Puppeteer)
-  client.on('remote_session_saved', () => {
-    logger.info('Remote session saved successfully');
-  });
-
-  // Manejo de errores del cliente
-  client.on('change_state', (state) => {
-    logger.info(`Client state changed to: ${state}`);
-  });
-
-  // Manejo de errores de loading screen
-  client.on('loading_screen', (percent, message) => {
-    logger.info(`Loading screen: ${percent}% - ${message}`);
-  });
-
-  SESSION_STATE.client = client;
-
   try {
-    // Iniciar la inicialización. Esto NO se bloquea en los endpoints HTTP.
-    await client.initialize();
+    // Cargar estado de autenticación
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
+
+    // Obtener la última versión de Baileys
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    logger.info(`Using WhatsApp Web v${version.join('.')}, isLatest: ${isLatest}`);
+
+    // Crear socket de WhatsApp
+    const socket = makeWASocket({
+      version,
+      logger: pino({ level: 'silent' }), // Silenciar logs internos de Baileys
+      printQRInTerminal: false,
+      auth: {
+        creds: state.creds,
+        keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' })),
+      },
+      generateHighQualityLinkPreview: true,
+      syncFullHistory: false,
+      markOnlineOnConnect: false,
+    });
+
+    SESSION_STATE.socket = socket;
+
+    // Evento: Actualización de conexión
+    socket.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      // Generar QR si está disponible
+      if (qr) {
+        try {
+          const base64Qr = await qrcode.toDataURL(qr);
+          SESSION_STATE.qr = base64Qr;
+          SESSION_STATE.status = 'qr';
+          SESSION_STATE.retryCount++;
+
+          logger.info(`QR code generated (attempt ${SESSION_STATE.retryCount}/${SESSION_STATE.maxRetries})`);
+
+          // Verificar si se alcanzó el máximo de reintentos
+          if (SESSION_STATE.retryCount >= SESSION_STATE.maxRetries) {
+            logger.warn('Max QR retries reached. Stopping connection attempts.');
+            SESSION_STATE.status = 'error';
+            SESSION_STATE.qr = null;
+            socket.end(new Error('Max QR retries reached'));
+          }
+        } catch (err) {
+          logger.error(err, 'Error generating QR code data URL');
+        }
+      }
+
+      // Manejar estado de conexión
+      if (connection === 'close') {
+        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        const reason = lastDisconnect?.error?.output?.statusCode;
+
+        logger.warn({ reason, shouldReconnect }, 'Connection closed');
+
+        if (shouldReconnect && SESSION_STATE.retryCount < SESSION_STATE.maxRetries) {
+          logger.info('Attempting to reconnect...');
+          SESSION_STATE.socket = null;
+          setTimeout(() => {
+            initializeWhatsApp().catch(err => logger.error(err, 'Failed to reconnect'));
+          }, 5000);
+        } else {
+          logger.warn('Not reconnecting. Either logged out or max retries reached.');
+          SESSION_STATE.socket = null;
+          SESSION_STATE.status = reason === DisconnectReason.loggedOut ? 'disconnected' : 'error';
+          SESSION_STATE.qr = null;
+        }
+      } else if (connection === 'open') {
+        logger.info('WhatsApp connection is now open!');
+        SESSION_STATE.status = 'connected';
+        SESSION_STATE.qr = null;
+        SESSION_STATE.retryCount = 0; // Reset retry count on successful connection
+      }
+    });
+
+    // Evento: Actualización de credenciales
+    socket.ev.on('creds.update', saveCreds);
+
+    // Evento: Mensajes (opcional, para logging)
+    socket.ev.on('messages.upsert', async ({ messages }) => {
+      const msg = messages[0];
+      if (msg.key.fromMe) return; // Ignorar mensajes propios
+
+      logger.debug({ from: msg.key.remoteJid, message: msg.message }, 'Received message');
+    });
+
   } catch (error) {
-    logger.error(error, 'Error initializing whatsapp-web.js client');
-    SESSION_STATE.client = null;
+    logger.error(error, 'Error initializing Baileys WhatsApp socket');
+    SESSION_STATE.socket = null;
     SESSION_STATE.status = 'error';
   }
 }
 
 async function closeSession() {
-  if (SESSION_STATE.client) {
-    logger.info('Disconnecting WhatsApp session...');
+  if (SESSION_STATE.socket) {
+    logger.info('Closing WhatsApp session...');
     try {
-      await SESSION_STATE.client.destroy(); // Usar destroy() para whatsapp-web.js
+      await SESSION_STATE.socket.logout();
+      SESSION_STATE.socket.end(undefined);
     } catch (error) {
-      logger.error(error, 'Error while closing WhatsApp client');
+      logger.error(error, 'Error while closing WhatsApp socket');
     } finally {
-      // El evento 'disconnected' se encargará de resetear el estado.
-      // Pero por si acaso, lo forzamos aquí también.
-      SESSION_STATE.client = null;
+      SESSION_STATE.socket = null;
       SESSION_STATE.status = 'disconnected';
       SESSION_STATE.qr = null;
-      logger.info('WhatsApp session disconnected and state reset.');
+      SESSION_STATE.retryCount = 0;
+      logger.info('WhatsApp session closed and state reset.');
     }
   }
 }
@@ -255,11 +238,12 @@ app.get('/health/ready', (req, res) => {
 
 app.use('/api', authMiddleware);
 
-// --- Rutas de Sesión (Modificadas para no ser bloqueantes) ---
+// --- Rutas de Sesión ---
 app.get('/api/status', (req, res) => {
   res.status(200).json({
     status: SESSION_STATE.status,
     hasQr: !!SESSION_STATE.qr,
+    retryCount: SESSION_STATE.retryCount,
   });
 });
 
@@ -272,6 +256,9 @@ app.post('/api/init', async (req, res, next) => {
     if (SESSION_STATE.status === 'connecting' || SESSION_STATE.status === 'qr') {
       return res.status(200).json({ message: 'Client is already initializing', status: SESSION_STATE.status });
     }
+
+    // Resetear contador de reintentos antes de iniciar
+    SESSION_STATE.retryCount = 0;
 
     // Iniciar el cliente
     initializeWhatsApp();
@@ -289,7 +276,6 @@ app.get('/api/qr', async (req, res, next) => {
     }
 
     if (SESSION_STATE.status === 'qr' && SESSION_STATE.qr) {
-      // El QR ya existe, enviarlo
       return res.status(200).json({ qr: SESSION_STATE.qr });
     }
 
@@ -297,12 +283,10 @@ app.get('/api/qr', async (req, res, next) => {
       return res.status(202).json({ message: 'Client is connecting, QR will be available soon...' });
     }
 
-    // Si está desconectado o en error, sugerir usar /api/init
     if (SESSION_STATE.status === 'disconnected' || SESSION_STATE.status === 'error') {
       return res.status(400).json({ message: 'Client not initialized. Use POST /api/init first', status: SESSION_STATE.status });
     }
 
-    // Estado inesperado
     return res.status(500).json({ message: 'Unexpected state', status: SESSION_STATE.status });
   } catch (error) {
     next(error);
@@ -321,7 +305,8 @@ app.post('/api/disconnect', async (req, res, next) => {
 app.post('/api/reconnect', async (req, res, next) => {
   try {
     await closeSession();
-    initializeWhatsApp(); // Inicia en segundo plano, NO se espera (await)
+    SESSION_STATE.retryCount = 0;
+    initializeWhatsApp();
     res.status(200).json({ message: 'Reconnection process initiated.' });
   } catch (error) {
     next(error);
@@ -341,16 +326,19 @@ app.post('/api/send', validateMessage, async (req, res, next) => {
   }
 
   try {
-    if (SESSION_STATE.status !== 'connected' || !SESSION_STATE.client) {
+    if (SESSION_STATE.status !== 'connected' || !SESSION_STATE.socket) {
       throw new AppError('WhatsApp client is not connected.', 409);
     }
+
     const { to, message } = req.body;
-    const formattedTo = `${to.replace(/\D/g, '')}@c.us`;
-    
-    // Usar client.sendMessage
-    const result = await SESSION_STATE.client.sendMessage(formattedTo, message);
-    
-    res.status(200).json({ success: true, data: result });
+
+    // Formatear número para Baileys: número@s.whatsapp.net
+    const formattedTo = to.includes('@') ? to : `${to.replace(/\D/g, '')}@s.whatsapp.net`;
+
+    // Enviar mensaje usando Baileys
+    const result = await SESSION_STATE.socket.sendMessage(formattedTo, { text: message });
+
+    res.status(200).json({ success: true, data: { messageId: result.key.id } });
   } catch (error) {
     next(error);
   }
@@ -372,10 +360,7 @@ const startServer = () => {
   server.listen(PORT, () => {
     logger.info(`Server running on port ${PORT} in ${NODE_ENV} mode`);
     logger.info(`Session Path: ${SESSION_PATH}`);
-    logger.info('WhatsApp client will initialize on first /api/qr or /api/reconnect request');
-
-    // NO iniciar automáticamente para evitar QRs innecesarios en Railway
-    // El cliente se iniciará cuando el usuario lo solicite mediante /api/qr
+    logger.info('WhatsApp client (Baileys) will initialize on first /api/init request');
   });
 };
 
@@ -392,63 +377,19 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 process.on('unhandledRejection', (reason, promise) => {
-  // Errores recuperables de Puppeteer - no cerrar el servidor
-  const recoverablePuppeteerErrors = [
-    'Execution context was destroyed',
-    'Target closed',
-    'Protocol error',
-    'Session closed',
-    'Navigation failed'
-  ];
+  logger.warn(reason, 'UNHANDLED REJECTION detected');
 
-  const isRecoverableError = reason && reason.message &&
-    recoverablePuppeteerErrors.some(errMsg => reason.message.includes(errMsg));
-
-  if (isRecoverableError) {
-    logger.warn(reason, 'Recoverable Puppeteer error detected, handling gracefully...');
-
-    // Si el cliente estaba conectado, intentar reconectar
-    if (SESSION_STATE.status === 'connected' || SESSION_STATE.status === 'connecting') {
-      logger.info('Attempting automatic reconnection after Puppeteer error...');
-      closeSession().then(() => {
-        setTimeout(() => {
-          initializeWhatsApp().catch(err => logger.error(err, 'Failed to auto-reconnect'));
-        }, 5000);
-      });
-    } else {
-      // Solo resetear el estado sin intentar reconectar
-      SESSION_STATE.client = null;
-      SESSION_STATE.status = 'disconnected';
-      SESSION_STATE.qr = null;
-    }
-    return;
+  // En Baileys, la mayoría de errores se manejan internamente
+  // Solo resetear estado si es crítico
+  if (SESSION_STATE.status === 'connected') {
+    logger.info('Attempting recovery...');
+    SESSION_STATE.status = 'error';
   }
-
-  // Para otros errores no manejados, cerrar el proceso
-  logger.fatal(reason, 'UNHANDLED REJECTION! Shutting down...');
-  process.exit(1);
 });
 
 process.on('uncaughtException', (err) => {
-  // Errores recuperables de Puppeteer - no cerrar el servidor
-  const recoverablePuppeteerErrors = [
-    'Execution context was destroyed',
-    'Target closed',
-    'Protocol error',
-    'Session closed'
-  ];
-
-  const isRecoverableError = err.message &&
-    recoverablePuppeteerErrors.some(errMsg => err.message.includes(errMsg));
-
-  if (isRecoverableError) {
-    logger.warn(err, 'Recoverable Puppeteer error detected (uncaught exception)');
-    return;
-  }
-
   logger.fatal(err, 'UNCAUGHT EXCEPTION! Shutting down...');
   process.exit(1);
 });
 
 startServer();
-
