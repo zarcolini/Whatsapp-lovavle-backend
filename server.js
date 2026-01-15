@@ -126,22 +126,30 @@ async function initializeWhatsApp() {
 
       // Manejar estado de conexión
       if (connection === 'close') {
-        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
         const reason = lastDisconnect?.error?.output?.statusCode;
+        const isLogout = reason === DisconnectReason.loggedOut;
+        const isConflict = reason === 428; // Connection taken over / Multi-device conflict
 
-        logger.warn({ reason, shouldReconnect }, 'Connection closed');
+        // Don't reconnect if explicitly logged out or if we already have no socket
+        const shouldReconnect = !isLogout && SESSION_STATE.socket !== null && SESSION_STATE.retryCount < SESSION_STATE.maxRetries;
 
-        if (shouldReconnect && SESSION_STATE.retryCount < SESSION_STATE.maxRetries) {
+        logger.warn({ reason, shouldReconnect, isLogout, isConflict }, 'Connection closed');
+
+        SESSION_STATE.socket = null;
+
+        if (shouldReconnect) {
           logger.info('Attempting to reconnect...');
-          SESSION_STATE.socket = null;
+          SESSION_STATE.status = 'connecting';
           setTimeout(() => {
-            initializeWhatsApp().catch(err => logger.error(err, 'Failed to reconnect'));
+            if (SESSION_STATE.socket === null) { // Double-check we still need to reconnect
+              initializeWhatsApp().catch(err => logger.error(err, 'Failed to reconnect'));
+            }
           }, 5000);
         } else {
           logger.warn('Not reconnecting. Either logged out or max retries reached.');
-          SESSION_STATE.socket = null;
-          SESSION_STATE.status = reason === DisconnectReason.loggedOut ? 'disconnected' : 'error';
+          SESSION_STATE.status = isLogout ? 'disconnected' : 'error';
           SESSION_STATE.qr = null;
+          SESSION_STATE.retryCount = 0;
         }
       } else if (connection === 'open') {
         logger.info('WhatsApp connection is now open!');
@@ -172,18 +180,25 @@ async function initializeWhatsApp() {
 async function closeSession() {
   if (SESSION_STATE.socket) {
     logger.info('Closing WhatsApp session...');
+    const socketToClose = SESSION_STATE.socket;
+
+    // Reset state first to prevent race conditions
+    SESSION_STATE.socket = null;
+    SESSION_STATE.status = 'disconnected';
+    SESSION_STATE.qr = null;
+    SESSION_STATE.retryCount = 0;
+
     try {
-      await SESSION_STATE.socket.logout();
-      SESSION_STATE.socket.end(undefined);
+      // Only logout if socket is still connected
+      if (socketToClose.ws?.readyState === 1) { // 1 = OPEN
+        await socketToClose.logout();
+      }
+      socketToClose.end(undefined);
     } catch (error) {
       logger.error(error, 'Error while closing WhatsApp socket');
-    } finally {
-      SESSION_STATE.socket = null;
-      SESSION_STATE.status = 'disconnected';
-      SESSION_STATE.qr = null;
-      SESSION_STATE.retryCount = 0;
-      logger.info('WhatsApp session closed and state reset.');
     }
+
+    logger.info('WhatsApp session closed and state reset.');
   }
 }
 
