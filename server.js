@@ -131,8 +131,23 @@ async function initializeWhatsApp() {
   // Evento: Cliente desconectado
   client.on('disconnected', (reason) => {
     logger.warn({ reason }, 'Client was disconnected');
-    // No llamamos a closeSession() aquí para evitar bucles.
-    // Simplemente reseteamos el estado.
+
+    // Si se alcanzó el máximo de reintentos de QR, no intentar reconectar automáticamente
+    if (reason === 'Max qrcode retries reached') {
+      logger.warn('Max QR retries reached. Client will not auto-reconnect. Use /api/init to restart.');
+      // Limpiar el cliente para evitar fugas de memoria
+      const clientToDestroy = SESSION_STATE.client;
+      SESSION_STATE.client = null;
+      SESSION_STATE.status = 'error';
+      SESSION_STATE.qr = null;
+
+      if (clientToDestroy) {
+        clientToDestroy.destroy().catch(err => logger.error(err, 'Error destroying client'));
+      }
+      return;
+    }
+
+    // Para otras razones de desconexión, resetear el estado normalmente
     SESSION_STATE.client = null;
     SESSION_STATE.status = 'disconnected';
     SESSION_STATE.qr = null;
@@ -377,17 +392,34 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 process.on('unhandledRejection', (reason, promise) => {
-  // Si el error es de contexto de ejecución destruido, solo loguear sin cerrar
-  if (reason && reason.message && reason.message.includes('Execution context was destroyed')) {
-    logger.warn(reason, 'Puppeteer navigation error detected, attempting to recover...');
-    // Intentar reconectar automáticamente
+  // Errores recuperables de Puppeteer - no cerrar el servidor
+  const recoverablePuppeteerErrors = [
+    'Execution context was destroyed',
+    'Target closed',
+    'Protocol error',
+    'Session closed',
+    'Navigation failed'
+  ];
+
+  const isRecoverableError = reason && reason.message &&
+    recoverablePuppeteerErrors.some(errMsg => reason.message.includes(errMsg));
+
+  if (isRecoverableError) {
+    logger.warn(reason, 'Recoverable Puppeteer error detected, handling gracefully...');
+
+    // Si el cliente estaba conectado, intentar reconectar
     if (SESSION_STATE.status === 'connected' || SESSION_STATE.status === 'connecting') {
-      logger.info('Attempting automatic reconnection...');
+      logger.info('Attempting automatic reconnection after Puppeteer error...');
       closeSession().then(() => {
         setTimeout(() => {
           initializeWhatsApp().catch(err => logger.error(err, 'Failed to auto-reconnect'));
         }, 5000);
       });
+    } else {
+      // Solo resetear el estado sin intentar reconectar
+      SESSION_STATE.client = null;
+      SESSION_STATE.status = 'disconnected';
+      SESSION_STATE.qr = null;
     }
     return;
   }
@@ -398,9 +430,19 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 process.on('uncaughtException', (err) => {
-  // Si el error es de contexto de ejecución destruido, solo loguear sin cerrar
-  if (err.message && err.message.includes('Execution context was destroyed')) {
-    logger.warn(err, 'Puppeteer navigation error detected (uncaught exception)');
+  // Errores recuperables de Puppeteer - no cerrar el servidor
+  const recoverablePuppeteerErrors = [
+    'Execution context was destroyed',
+    'Target closed',
+    'Protocol error',
+    'Session closed'
+  ];
+
+  const isRecoverableError = err.message &&
+    recoverablePuppeteerErrors.some(errMsg => err.message.includes(errMsg));
+
+  if (isRecoverableError) {
+    logger.warn(err, 'Recoverable Puppeteer error detected (uncaught exception)');
     return;
   }
 
