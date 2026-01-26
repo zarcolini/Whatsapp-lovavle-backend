@@ -59,10 +59,10 @@ class AppError extends Error {
 // ============================================================
 const SESSION_STATE = {
   socket: null,
-  status: 'disconnected', // 'disconnected', 'qr', 'connecting', 'connected', 'error'
+  status: 'disconnected', // 'disconnected', 'qr', 'connecting', 'connected', 'paused', 'error'
   qr: null, // Almacenará el QR en formato base64 Data URL
-  retryCount: 0,
-  maxRetries: 3,
+  reconnectAttempts: 0,
+  maxReconnectAttempts: 5, // Máximo de intentos de reconexión antes de pausar
 };
 
 async function initializeWhatsApp() {
@@ -108,17 +108,7 @@ async function initializeWhatsApp() {
           const base64Qr = await qrcode.toDataURL(qr);
           SESSION_STATE.qr = base64Qr;
           SESSION_STATE.status = 'qr';
-          SESSION_STATE.retryCount++;
-
-          logger.info(`QR code generated (attempt ${SESSION_STATE.retryCount}/${SESSION_STATE.maxRetries})`);
-
-          // Verificar si se alcanzó el máximo de reintentos
-          if (SESSION_STATE.retryCount >= SESSION_STATE.maxRetries) {
-            logger.warn('Max QR retries reached. Stopping connection attempts.');
-            SESSION_STATE.status = 'error';
-            SESSION_STATE.qr = null;
-            socket.end(new Error('Max QR retries reached'));
-          }
+          logger.info('QR code generated - waiting for scan...');
         } catch (err) {
           logger.error(err, 'Error generating QR code data URL');
         }
@@ -130,32 +120,50 @@ async function initializeWhatsApp() {
         const isLogout = reason === DisconnectReason.loggedOut;
         const isConflict = reason === 428; // Connection taken over / Multi-device conflict
 
-        // Don't reconnect if explicitly logged out or if we already have no socket
-        const shouldReconnect = !isLogout && SESSION_STATE.socket !== null && SESSION_STATE.retryCount < SESSION_STATE.maxRetries;
-
-        logger.warn({ reason, shouldReconnect, isLogout, isConflict }, 'Connection closed');
+        logger.warn({ reason, isLogout, isConflict, reconnectAttempts: SESSION_STATE.reconnectAttempts }, 'Connection closed');
 
         SESSION_STATE.socket = null;
 
-        if (shouldReconnect) {
-          logger.info('Attempting to reconnect...');
-          SESSION_STATE.status = 'connecting';
-          setTimeout(() => {
-            if (SESSION_STATE.socket === null) { // Double-check we still need to reconnect
-              initializeWhatsApp().catch(err => logger.error(err, 'Failed to reconnect'));
-            }
-          }, 5000);
-        } else {
-          logger.warn('Not reconnecting. Either logged out or max retries reached.');
-          SESSION_STATE.status = isLogout ? 'disconnected' : 'error';
+        // No reconectar si se cerró sesión explícitamente
+        if (isLogout) {
+          logger.warn('Logged out explicitly. Not reconnecting.');
+          SESSION_STATE.status = 'disconnected';
           SESSION_STATE.qr = null;
-          SESSION_STATE.retryCount = 0;
+          SESSION_STATE.reconnectAttempts = 0;
+          return;
         }
+
+        // Incrementar contador de intentos de reconexión
+        SESSION_STATE.reconnectAttempts++;
+
+        // Verificar si alcanzamos el máximo de intentos
+        if (SESSION_STATE.reconnectAttempts >= SESSION_STATE.maxReconnectAttempts) {
+          logger.warn(`Max reconnect attempts (${SESSION_STATE.maxReconnectAttempts}) reached. Pausing connection.`);
+          SESSION_STATE.status = 'paused';
+          SESSION_STATE.qr = null;
+          // No resetear reconnectAttempts para que el usuario sepa que está pausado
+          return;
+        }
+
+        // Intentar reconectar
+        logger.info(`Attempting to reconnect (attempt ${SESSION_STATE.reconnectAttempts}/${SESSION_STATE.maxReconnectAttempts})...`);
+        SESSION_STATE.status = 'connecting';
+
+        // Delay exponencial: 5s, 10s, 20s, 40s, 80s
+        const delay = Math.min(5000 * Math.pow(2, SESSION_STATE.reconnectAttempts - 1), 80000);
+        logger.info(`Waiting ${delay / 1000}s before reconnecting...`);
+
+        setTimeout(() => {
+          if (SESSION_STATE.socket === null && SESSION_STATE.status !== 'paused') {
+            initializeWhatsApp().catch(err => logger.error(err, 'Failed to reconnect'));
+          }
+        }, delay);
+
       } else if (connection === 'open') {
         logger.info('WhatsApp connection is now open!');
         SESSION_STATE.status = 'connected';
         SESSION_STATE.qr = null;
-        SESSION_STATE.retryCount = 0; // Reset retry count on successful connection
+        SESSION_STATE.reconnectAttempts = 0; // Reset en conexión exitosa
       }
     });
 
@@ -186,7 +194,7 @@ async function closeSession() {
     SESSION_STATE.socket = null;
     SESSION_STATE.status = 'disconnected';
     SESSION_STATE.qr = null;
-    SESSION_STATE.retryCount = 0;
+    SESSION_STATE.reconnectAttempts = 0;
 
     try {
       // Only logout if socket is still connected
@@ -258,7 +266,8 @@ app.get('/api/status', (req, res) => {
   res.status(200).json({
     status: SESSION_STATE.status,
     hasQr: !!SESSION_STATE.qr,
-    retryCount: SESSION_STATE.retryCount,
+    reconnectAttempts: SESSION_STATE.reconnectAttempts,
+    maxReconnectAttempts: SESSION_STATE.maxReconnectAttempts,
   });
 });
 
@@ -272,8 +281,8 @@ app.post('/api/init', async (req, res, next) => {
       return res.status(200).json({ message: 'Client is already initializing', status: SESSION_STATE.status });
     }
 
-    // Resetear contador de reintentos antes de iniciar
-    SESSION_STATE.retryCount = 0;
+    // Resetear contador de intentos antes de iniciar
+    SESSION_STATE.reconnectAttempts = 0;
 
     // Iniciar el cliente
     initializeWhatsApp();
@@ -298,6 +307,14 @@ app.get('/api/qr', async (req, res, next) => {
       return res.status(202).json({ message: 'Client is connecting, QR will be available soon...' });
     }
 
+    if (SESSION_STATE.status === 'paused') {
+      return res.status(503).json({
+        message: `Connection paused after ${SESSION_STATE.maxReconnectAttempts} failed attempts. Use POST /api/reconnect to try again.`,
+        status: SESSION_STATE.status,
+        reconnectAttempts: SESSION_STATE.reconnectAttempts
+      });
+    }
+
     if (SESSION_STATE.status === 'disconnected' || SESSION_STATE.status === 'error') {
       return res.status(400).json({ message: 'Client not initialized. Use POST /api/init first', status: SESSION_STATE.status });
     }
@@ -320,7 +337,7 @@ app.post('/api/disconnect', async (req, res, next) => {
 app.post('/api/reconnect', async (req, res, next) => {
   try {
     await closeSession();
-    SESSION_STATE.retryCount = 0;
+    SESSION_STATE.reconnectAttempts = 0;
     initializeWhatsApp();
     res.status(200).json({ message: 'Reconnection process initiated.' });
   } catch (error) {
