@@ -13,10 +13,12 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 
 # ==============================================================================
-# 3. Instalar Dependencias de Node.js
-# Usamos --omit=dev para no instalar dependencias de desarrollo (ej. nodemon)
+# 3. Instalar git (requerido para dependencias de GitHub como Baileys)
+# y dependencias de Node.js
 # ==============================================================================
-RUN npm install --omit=dev --no-fund --no-audit
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install --omit=dev --no-fund --no-audit
 
 # ==============================================================================
 # 4. Copiar el Código de la Aplicación
