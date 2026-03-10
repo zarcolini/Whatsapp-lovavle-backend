@@ -57,12 +57,13 @@ class AppError extends Error {
 // ============================================================
 // 4. GESTIÓN DE ESTADO Y SERVICIO DE WHATSAPP (Baileys)
 // ============================================================
+const MAX_RECONNECT_ATTEMPTS = 5;
+
 const SESSION_STATE = {
   socket: null,
   status: 'disconnected', // 'disconnected', 'qr', 'connecting', 'connected', 'paused', 'error'
   qr: null, // Almacenará el QR en formato base64 Data URL
   reconnectAttempts: 0,
-  maxReconnectAttempts: 5, // Máximo de intentos de reconexión antes de pausar
 };
 
 async function initializeWhatsApp() {
@@ -137,16 +138,15 @@ async function initializeWhatsApp() {
         SESSION_STATE.reconnectAttempts++;
 
         // Verificar si alcanzamos el máximo de intentos
-        if (SESSION_STATE.reconnectAttempts >= SESSION_STATE.maxReconnectAttempts) {
-          logger.warn(`Max reconnect attempts (${SESSION_STATE.maxReconnectAttempts}) reached. Pausing connection.`);
+        if (SESSION_STATE.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+          logger.warn(`Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Pausing connection.`);
           SESSION_STATE.status = 'paused';
           SESSION_STATE.qr = null;
-          // No resetear reconnectAttempts para que el usuario sepa que está pausado
           return;
         }
 
         // Intentar reconectar
-        logger.info(`Attempting to reconnect (attempt ${SESSION_STATE.reconnectAttempts}/${SESSION_STATE.maxReconnectAttempts})...`);
+        logger.info(`Attempting to reconnect (attempt ${SESSION_STATE.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
         SESSION_STATE.status = 'connecting';
 
         // Delay exponencial: 5s, 10s, 20s, 40s, 80s
@@ -267,7 +267,6 @@ app.get('/api/status', (req, res) => {
     status: SESSION_STATE.status,
     hasQr: !!SESSION_STATE.qr,
     reconnectAttempts: SESSION_STATE.reconnectAttempts,
-    maxReconnectAttempts: SESSION_STATE.maxReconnectAttempts,
   });
 });
 
@@ -281,10 +280,10 @@ app.post('/api/init', async (req, res, next) => {
       return res.status(200).json({ message: 'Client is already initializing', status: SESSION_STATE.status });
     }
 
-    // Resetear contador de intentos antes de iniciar
+    // Resetear intentos y estado (incluye cuando está en 'paused')
     SESSION_STATE.reconnectAttempts = 0;
+    SESSION_STATE.status = 'disconnected';
 
-    // Iniciar el cliente
     initializeWhatsApp();
 
     return res.status(202).json({ message: 'WhatsApp client initialization started', status: 'connecting' });
@@ -309,7 +308,7 @@ app.get('/api/qr', async (req, res, next) => {
 
     if (SESSION_STATE.status === 'paused') {
       return res.status(503).json({
-        message: `Connection paused after ${SESSION_STATE.maxReconnectAttempts} failed attempts. Use POST /api/reconnect to try again.`,
+        message: `Connection paused after ${MAX_RECONNECT_ATTEMPTS} failed attempts. Use POST /api/init to retry.`,
         status: SESSION_STATE.status,
         reconnectAttempts: SESSION_STATE.reconnectAttempts
       });
