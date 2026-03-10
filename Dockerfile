@@ -18,6 +18,7 @@ COPY package.json package-lock.json* ./
 # ==============================================================================
 RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/* \
+    && git config --global url."https://".insteadOf "ssh://git@" \
     && npm install --omit=dev --no-fund --no-audit
 
 # ==============================================================================
